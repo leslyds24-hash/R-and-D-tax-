@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: rd-tax-credit-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: "https://api.groq.com/openai/v1"
+      - key: OPENAI_MODEL
+        value: "llama-3.3-70b-versatile"
+      - key: FORCE_LLM
+        value: "true"
+      - key: VALID_API_KEYS
+        value: "demo-key"
