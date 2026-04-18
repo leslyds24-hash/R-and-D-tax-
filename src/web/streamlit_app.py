@@ -133,7 +133,7 @@ def render_form_6765_pdf_local(payload: dict) -> bytes:
 
 backend_url = st.text_input(
     "Backend URL",
-    value=os.environ.get("BACKEND_URL", "http://127.0.0.1:8000"),
+    value=os.environ.get("BACKEND_URL", "https://r-and-d-tax.onrender.com"),
 )
 user_id = st.text_input("User ID (for trace)", value="demo-user")
 
