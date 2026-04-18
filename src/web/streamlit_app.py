@@ -203,7 +203,8 @@ if results_df is not None and not results_df.empty:
                 if four_part:
                     st.write("**Four-Part Test Scores:**")
                     for k,v in four_part.items():
-                        st.write(f"• {k.replace('_',' ').title()}: {v:.2f}")
+                        display_val = f"{v:.2f}" if isinstance(v, (int, float)) else str(v)
+                        st.write(f"• {k.replace('_',' ').title()}: {display_val}")
                 flippers = result.get("decision_flippers", [])
                 if flippers:
                     st.write("**Decision Sensitivity:**")
