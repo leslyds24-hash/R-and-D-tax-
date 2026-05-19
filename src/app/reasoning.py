@@ -2,7 +2,8 @@ import os
 import uuid
 import json
 import re
-from typing import Tuple, Dict, Any
+from dataclasses import dataclass, field
+from typing import Tuple, Dict, Any, Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -15,8 +16,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 _IS_LOCAL_LLM = LLM_BASE_URL.startswith(("http://localhost", "http://127.0.0.1", "https://localhost", "https://127.0.0.1"))
 
-# Default to qwen2.5:7b if local usage is detected (common for Ollama), otherwise gpt-4o
-_DEFAULT_MODEL = "qwen2.5:7b" if _IS_LOCAL_LLM else "gpt-4o"
+# Default to qwen2.5:3b if local usage is detected (common for Ollama), otherwise gpt-4o
+_DEFAULT_MODEL = "qwen2.5:3b" if _IS_LOCAL_LLM else "gpt-4o"
 MODEL_NAME = os.getenv("OPENAI_MODEL", _DEFAULT_MODEL)
 
 _LOCAL_PREFIXES = ("http://localhost", "http://127.0.0.1", "https://localhost", "https://127.0.0.1")
@@ -57,6 +58,14 @@ def _make_sync_client():
 
 # Async client with short timeout & light retry (created only if LLM enabled)
 _async_client = _make_async_client()
+
+_LLM_JSON_SCHEMA = (
+    '{"eligible": true|false, "confidence": 0.0-1.0, "rationale": "short explanation", '
+    '"permitted_purpose": "met|uncertain|not_met", '
+    '"elimination_uncertainty": "met|uncertain|not_met", '
+    '"process_experimentation": "met|uncertain|not_met", '
+    '"technological_nature": "met|uncertain|not_met"}'
+)
 
 LLM_SYSTEM_PROMPT = (
     "You are an expert IRS R&D Tax Credit (Section 41) eligibility analyst with deep expertise in "
@@ -136,6 +145,15 @@ def _coerce_confidence(val) -> float:
                 x = 0.6
     return max(0.0, min(1.0, x))
 
+@dataclass
+class TierResult:
+    decided: bool           # True = this tier produced a final answer; False = pass to next tier
+    eligible: bool
+    confidence: float
+    rationale: str
+    criteria: Optional[Dict[str, str]] = None
+    trace_step: Optional[TraceStep] = None
+
 # -------------------------
 # Hard Filter: Rule-Out Classifier (Tier 1)
 # -------------------------
@@ -202,50 +220,44 @@ def _heuristic_rationale(description: str, eligible: bool) -> str:
     else:
         return "Insufficient evidence of a technological process of experimentation under Section 41."
 
-def _normalize_llm_json(obj: dict, description: str) -> tuple[bool, float, str]:
+_CRITERIA_KEYS = ("permitted_purpose", "elimination_uncertainty", "process_experimentation", "technological_nature")
+_VALID_CRITERION_VALUES = {"met", "uncertain", "not_met"}
+
+def _normalize_llm_json(obj: dict, description: str) -> tuple[bool, float, str, dict | None]:
     """
-    Parse LLM response (supports both old simple format and new detailed format).
-    Builds rationale that cites all four criteria if available.
+    Parse LLM response. Returns (eligible, confidence, rationale, criteria).
+    criteria is a Dict[str, str] when the LLM returned four-part fields, None otherwise.
     """
     eligible = bool(obj.get("eligible", False))
     confidence = _coerce_confidence(obj.get("confidence"))
-    
-    # Try new detailed format first
-    criteria_status = {
-        "permitted_purpose": obj.get("permitted_purpose", ""),
-        "elimination_uncertainty": obj.get("elimination_uncertainty", ""),
-        "process_experimentation": obj.get("process_experimentation", ""),
-        "technological_nature": obj.get("technological_nature", ""),
-    }
-    
-    # If we have detailed criteria, build a richer rationale
-    if any(criteria_status.values()):
-        met_count = sum(1 for v in criteria_status.values() if v == "met")
-        uncertain_count = sum(1 for v in criteria_status.values() if v == "uncertain")
-        not_met_count = sum(1 for v in criteria_status.values() if v == "not_met")
-        
-        criteria_summary = f"Criteria Status: {met_count} met, {uncertain_count} uncertain, {not_met_count} not met."
-        
-        # Use LLM's rationale if available, or synthesize
+
+    raw_criteria = {k: obj.get(k, "") for k in _CRITERIA_KEYS}
+    criteria: dict | None = None
+    if any(raw_criteria.values()):
+        # Normalise values: accept only the three valid strings
+        criteria = {
+            k: v if v in _VALID_CRITERION_VALUES else "uncertain"
+            for k, v in raw_criteria.items()
+        }
+        met_count = sum(1 for v in criteria.values() if v == "met")
+        uncertain_count = sum(1 for v in criteria.values() if v == "uncertain")
+        not_met_count = sum(1 for v in criteria.values() if v == "not_met")
+        criteria_summary = f"Criteria: {met_count} met, {uncertain_count} uncertain, {not_met_count} not met."
         rationale = obj.get("rationale") or obj.get("reason") or obj.get("explanation") or ""
         if isinstance(rationale, list):
             rationale = " ".join(str(x) for x in rationale if x)
         rationale = (rationale or "").strip()
-        if rationale:
-            rationale = f"{rationale} {criteria_summary}"
-        else:
-            rationale = criteria_summary
+        rationale = f"{rationale} {criteria_summary}" if rationale else criteria_summary
     else:
-        # Fall back to simple format
         rationale = obj.get("rationale") or obj.get("reason") or obj.get("explanation")
         if isinstance(rationale, list):
             rationale = " ".join(str(x) for x in rationale if x)
         rationale = (rationale or "").strip()
-    
+
     if not rationale:
         rationale = _heuristic_rationale(description, eligible)
-    
-    return eligible, confidence, rationale
+
+    return eligible, confidence, rationale, criteria
 
 # -------------------------
 # Param builders (handle GPT-5 quirks)
@@ -258,10 +270,9 @@ def _build_chat_params(model: str, messages: list, want_json: bool = True) -> Di
     """
     params: Dict[str, Any] = {"model": model, "messages": messages}
     if _is_gpt5(model):
-        params["max_tokens"] = 160
+        params["max_tokens"] = 300
     else:
-        # Lower token limit for local models to prevent timeouts on long generation
-        params["max_tokens"] = 120 if "qwen" in model or "llama" in model else 160
+        params["max_tokens"] = 300
         params["temperature"] = 0
     if want_json:
         params["response_format"] = {"type": "json_object"}
@@ -317,13 +328,15 @@ def _backfill_rationale_sync(description: str, eligible: bool) -> str:
 # Async LLM helper with graceful retry
 # -------------------------
 def _model_candidates() -> list:
-    env_fallback = os.getenv("OPENAI_MODEL_FALLBACK")
     candidates = [MODEL_NAME]
+    env_fallback = os.getenv("OPENAI_MODEL_FALLBACK")
     if env_fallback and env_fallback not in candidates:
         candidates.append(env_fallback)
-    for m in ("gpt-4o-mini", "gpt-4o", "gpt-4-mini"):
-        if m not in candidates:
-            candidates.append(m)
+    # Only add cloud fallbacks when not pointing at a local endpoint
+    if not _IS_LOCAL_LLM:
+        for m in ("gpt-4o-mini", "gpt-4o"):
+            if m not in candidates:
+                candidates.append(m)
     return candidates
 
 
@@ -447,6 +460,87 @@ def _chat_llm_sync(model: str, messages: list) -> Dict[str, Any]:
     return {}
 
 # -------------------------
+# Tier functions — each returns TierResult with decided=True/False
+# -------------------------
+def _tier1_rule_out(record: ProjectRecord) -> TierResult:
+    eligible, conf, reason = rule_out_classifier(record.description)
+    if eligible is False:
+        return TierResult(
+            decided=True, eligible=False, confidence=conf, rationale=reason,
+            trace_step=TraceStep(
+                step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+                model_name="rule-out-filter:v1", thought="Apply hard-filter rule-out (Tier 1).",
+                action="rule_out_filter", observation="Matched ineligible patterns.",
+                confidence=conf,
+            ),
+        )
+    return TierResult(decided=False, eligible=False, confidence=0.0, rationale="")
+
+
+def _tier2_heuristic(record: ProjectRecord) -> TierResult:
+    eligible, conf, reason = rule_based_classifier(record.description)
+    return TierResult(
+        decided=True, eligible=eligible, confidence=conf, rationale=reason,
+        trace_step=TraceStep(
+            step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+            model_name="rule-based-heuristic:v1", thought="Apply rule-based heuristic (Tier 2).",
+            action="rule_based_classify", observation="No LLM available, using heuristic scoring.",
+            confidence=conf,
+        ),
+    )
+
+
+async def _tier3_llm_async(record: ProjectRecord) -> TierResult:
+    obj = await _chat_llm_async(
+        MODEL_NAME,
+        [
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user", "content":
+                "Project Description: " + (record.description or "")
+                + "\nReturn ONLY valid JSON with all fields present: "
+                + _LLM_JSON_SCHEMA},
+        ],
+    )
+    eligible, confidence, rationale, criteria = _normalize_llm_json(obj, record.description)
+    if not rationale:
+        rationale = await _backfill_rationale_async(record.description, eligible)
+    return TierResult(
+        decided=True, eligible=eligible, confidence=confidence, rationale=rationale, criteria=criteria,
+        trace_step=TraceStep(
+            step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+            model_name=f"openai:{MODEL_NAME}", thought="Apply IRS Section 41 via LLM (Tier 3, async).",
+            action="classify_with_llm", observation="chat.completions (JSON-preferred)",
+            confidence=confidence,
+        ),
+    )
+
+
+def _tier3_llm_sync(record: ProjectRecord) -> TierResult:
+    obj = _chat_llm_sync(
+        MODEL_NAME,
+        [
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user", "content":
+                "Project Description: " + (record.description or "")
+                + "\nReturn ONLY valid JSON with all fields present: "
+                + _LLM_JSON_SCHEMA},
+        ],
+    )
+    eligible, confidence, rationale, criteria = _normalize_llm_json(obj, record.description)
+    if not rationale:
+        rationale = _backfill_rationale_sync(record.description, eligible)
+    return TierResult(
+        decided=True, eligible=eligible, confidence=confidence, rationale=rationale, criteria=criteria,
+        trace_step=TraceStep(
+            step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+            model_name=f"openai:{MODEL_NAME}", thought="Apply IRS Section 41 via LLM (Tier 3).",
+            action="classify_with_llm", observation="chat.completions (JSON-preferred)",
+            confidence=confidence,
+        ),
+    )
+
+
+# -------------------------
 # Dual Model Cross-Check (Optional Advanced Feature - Phase 1.3)
 # -------------------------
 def _verify_criteria_mismatch(primary: dict, verifier: dict) -> int:
@@ -543,81 +637,49 @@ def analyze_with_dual_check(
 # Async analyzer (for concurrent pipelines)
 # -------------------------
 async def analyze_project_async(record: ProjectRecord, user_id: str = "demo-user"):
-    steps = []
-    now = datetime.utcnow().isoformat() + "Z"
-
-    # Step 1: Parse
-    steps.append(TraceStep(
-        step_id=str(uuid.uuid4()), timestamp=now, model_name="parser:v0",
-        thought="Parse incoming project record into analysis fields.",
+    steps = [TraceStep(
+        step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+        model_name="parser:v0", thought="Parse incoming project record into analysis fields.",
         action="parse", observation=f"Got description length={len(record.description or '')}",
-        confidence=1.0
-    ))
+        confidence=1.0,
+    )]
 
-    # Step 2: Classify (Tiered: Rule-Out → Rule-Based → LLM)
-    # Tier 1: Hard Filter (Rule-Out)
-    ruled_out, ruled_out_conf, ruled_out_reason = rule_out_classifier(record.description)
-    if ruled_out is False:
-        # Hard-filtered out
-        eligible, confidence, rationale = False, ruled_out_conf, ruled_out_reason
-        steps.append(TraceStep(
-            step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-            model_name="rule-out-filter:v1", thought="Apply hard-filter rule-out (Tier 1).",
-            action="rule_out_filter", observation=f"Matched ineligible patterns.",
-            confidence=confidence
-        ))
-    # Tier 2: Rule-Based Heuristic (if not ruled out and LLM unavailable)
-    elif not (USE_LLM and _async_client is not None):
-        eligible, confidence, rationale = rule_based_classifier(record.description)
-        steps.append(TraceStep(
-            step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-            model_name="rule-based-heuristic:v1", thought="Apply rule-based heuristic (Tier 2).",
-            action="rule_based_classify", observation="No LLM available, using heuristic scoring.",
-            confidence=confidence
-        ))
-    # Tier 3: LLM Analytical (if not ruled out and LLM available)
-    else:
-        try:
-            steps.append(TraceStep(
-                step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-                model_name=f"openai:{MODEL_NAME}", thought="Apply IRS Section 41 via LLM (Tier 3, async).",
-                action="classify_with_llm", observation="chat.completions (JSON-preferred)", confidence=0.5
-            ))
-            obj = await _chat_llm_async(
-                MODEL_NAME,
-                [
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content":
-                        "Project Description: "
-                        + (record.description or "")
-                        + "\nReturn ONLY valid JSON with all fields present: "
-                          '{"eligible": true|false, "confidence": 0..1, "rationale": "1 short sentence"}'}
-                ]
-            )
-            eligible, confidence, rationale = _normalize_llm_json(obj, record.description)
-            if not rationale:
-                rationale = await _backfill_rationale_async(record.description, eligible)
-        except Exception as e:
-            # Fall back to Tier 2 if LLM fails
-            eligible, confidence, rationale = rule_based_classifier(record.description)
-            rationale = f"LLM error fallback (Tier 3→2) -> {e} -> {rationale}"
+    result = _tier1_rule_out(record)
+    if result.trace_step:
+        steps.append(result.trace_step)
 
-    # Step 3: Decide
-    confidence = _coerce_confidence(confidence)
+    if not result.decided:
+        if USE_LLM and _async_client is not None:
+            try:
+                result = await _tier3_llm_async(record)
+            except Exception as e:
+                fb = _tier2_heuristic(record)
+                result = TierResult(
+                    decided=True, eligible=fb.eligible, confidence=fb.confidence,
+                    rationale=f"LLM error fallback (Tier 3→2) -> {e} -> {fb.rationale}",
+                    trace_step=fb.trace_step,
+                )
+        else:
+            result = _tier2_heuristic(record)
+        if result.trace_step:
+            steps.append(result.trace_step)
+
+    confidence = _coerce_confidence(result.confidence)
     steps.append(TraceStep(
         step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
         model_name="decision:v0", thought="Consolidate evidence and decide eligibility.",
-        action="decide", observation=f"eligible={eligible}, confidence={confidence:.2f}", confidence=confidence
+        action="decide", observation=f"eligible={result.eligible}, confidence={confidence:.2f}",
+        confidence=confidence,
     ))
 
     classification = ClassificationResult(
-        project_id=record.project_id, eligible=eligible, confidence=confidence,
-        rationale=rationale, region="US-IRS-Section-41"
+        project_id=record.project_id, eligible=result.eligible, confidence=confidence,
+        rationale=result.rationale, region="US-IRS-Section-41", criteria=result.criteria,
     )
     trace = TraceEnvelope(
         user_id=user_id, project_id=record.project_id, steps=steps,
         model_name=(f"openai:{MODEL_NAME}" if USE_LLM else "rule-based:v0"),
-        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False
+        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False,
     ).model_dump()
     return classification, trace
 
@@ -844,156 +906,87 @@ def _template_narrative(project_name: str, description: str) -> str:
 # Sync analyzer (kept for compatibility)
 # -------------------------
 def analyze_project(record: ProjectRecord, user_id: str = "demo-user"):
-    steps = []
-    now = datetime.utcnow().isoformat() + "Z"
-
-    steps.append(TraceStep(
-        step_id=str(uuid.uuid4()), timestamp=now, model_name="parser:v0",
-        thought="Parse incoming project record into analysis fields.",
+    steps = [TraceStep(
+        step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
+        model_name="parser:v0", thought="Parse incoming project record into analysis fields.",
         action="parse", observation=f"Got description length={len(record.description or '')}",
-        confidence=1.0
-    ))
+        confidence=1.0,
+    )]
 
-    if USE_LLM and OpenAI is not None:
-        # Tier 1: Hard Filter (Rule-Out)
-        ruled_out, ruled_out_conf, ruled_out_reason = rule_out_classifier(record.description)
-        if ruled_out is False:
-            # Hard-filtered out
-            eligible, confidence, rationale = False, ruled_out_conf, ruled_out_reason
-            steps.append(TraceStep(
-                step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-                model_name="rule-out-filter:v1", thought="Apply hard-filter rule-out (Tier 1).",
-                action="rule_out_filter", observation=f"Matched ineligible patterns.",
-                confidence=confidence
-            ))
-        else:
-            # Tier 3: LLM Analytical (if not ruled out)
+    result = _tier1_rule_out(record)
+    if result.trace_step:
+        steps.append(result.trace_step)
+
+    if not result.decided:
+        if USE_LLM and OpenAI is not None:
             try:
-                steps.append(TraceStep(
-                    step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-                    model_name=f"openai:{MODEL_NAME}", thought="Apply IRS Section 41 via LLM (Tier 3).",
-                    action="classify_with_llm", observation="chat.completions (JSON-preferred)", confidence=0.5
-                ))
-                obj = _chat_llm_sync(
-                    MODEL_NAME,
-                    [
-                        {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                        {"role": "user", "content":
-                            "Project Description: "
-                            + (record.description or "")
-                            + "\nReturn ONLY valid JSON with all fields present: "
-                              '{"eligible": true|false, "confidence": 0..1, "rationale": "1 short sentence"}'}
-                    ]
-                )
-                eligible, confidence, rationale = _normalize_llm_json(obj, record.description)
-                if not rationale:
-                    rationale = _backfill_rationale_sync(record.description, eligible)
+                result = _tier3_llm_sync(record)
             except Exception as e:
-                # Fall back to Tier 2 if LLM fails
-                eligible, confidence, rationale = rule_based_classifier(record.description)
-                rationale = f"LLM error fallback (Tier 3→2) -> {e} -> {rationale}"
-    else:
-        # Tier 1: Hard Filter (Rule-Out)
-        ruled_out, ruled_out_conf, ruled_out_reason = rule_out_classifier(record.description)
-        if ruled_out is False:
-            # Hard-filtered out
-            eligible, confidence, rationale = False, ruled_out_conf, ruled_out_reason
-            steps.append(TraceStep(
-                step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-                model_name="rule-out-filter:v1", thought="Apply hard-filter rule-out (Tier 1).",
-                action="rule_out_filter", observation=f"Matched ineligible patterns.",
-                confidence=confidence
-            ))
+                fb = _tier2_heuristic(record)
+                result = TierResult(
+                    decided=True, eligible=fb.eligible, confidence=fb.confidence,
+                    rationale=f"LLM error fallback (Tier 3→2) -> {e} -> {fb.rationale}",
+                    trace_step=fb.trace_step,
+                )
         else:
-            # Tier 2: Rule-Based Heuristic (if not ruled out and LLM unavailable)
-            eligible, confidence, rationale = rule_based_classifier(record.description)
-            steps.append(TraceStep(
-                step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-                model_name="rule-based-heuristic:v1", thought="Apply rule-based heuristic (Tier 2).",
-                action="rule_based_classify", observation="No LLM available, using heuristic scoring.",
-                confidence=confidence
-            ))
+            result = _tier2_heuristic(record)
+        if result.trace_step:
+            steps.append(result.trace_step)
 
-    confidence = _coerce_confidence(confidence)
+    confidence = _coerce_confidence(result.confidence)
     steps.append(TraceStep(
         step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
         model_name="decision:v0", thought="Consolidate evidence and decide eligibility.",
-        action="decide", observation=f"eligible={eligible}, confidence={confidence:.2f}", confidence=confidence
+        action="decide", observation=f"eligible={result.eligible}, confidence={confidence:.2f}",
+        confidence=confidence,
     ))
 
     classification = ClassificationResult(
-        project_id=record.project_id, eligible=eligible, confidence=confidence,
-        rationale=rationale, region="US-IRS-Section-41"
+        project_id=record.project_id, eligible=result.eligible, confidence=confidence,
+        rationale=result.rationale, region="US-IRS-Section-41", criteria=result.criteria,
     )
     trace = TraceEnvelope(
         user_id=user_id, project_id=record.project_id, steps=steps,
         model_name=(f"openai:{MODEL_NAME}" if USE_LLM else "rule-based:v0"),
-        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False
+        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False,
     ).model_dump()
 
-    # Attach a short narrative in the trace for exports (LLM or template)
-    if USE_LLM:
-        # already handled in the LLM branch; keep rationale text only
-        pass
-    else:
+    if not USE_LLM:
         trace["narrative_excerpt"] = _template_narrative(record.project_name, record.description)
 
     return classification, trace
 
 
 def analyze_project_strict(record: ProjectRecord, user_id: str = "demo-user"):
-    """LLM-only analysis: always call the LLM and raise on errors. No rule-based fallback.
-
-    This is useful for testing with external datasets to ensure model-driven outputs.
-    """
+    """LLM-only analysis: always call the LLM and raise on errors. No rule-based fallback."""
     if not (USE_LLM and OpenAI is not None):
         raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY and install SDK.")
 
-    steps = []
-    now = datetime.utcnow().isoformat() + "Z"
-
-    steps.append(TraceStep(
-        step_id=str(uuid.uuid4()), timestamp=now, model_name="parser:v0",
-        thought="Parse incoming project record into analysis fields.",
-        action="parse", observation=f"Got description length={len(record.description or '')}",
-        confidence=1.0
-    ))
-
-    # Always call LLM and propagate exceptions
-    steps.append(TraceStep(
+    steps = [TraceStep(
         step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
-        model_name=f"openai:{MODEL_NAME}", thought="Apply IRS Section 41 via LLM (strict).",
-        action="classify_with_llm", observation="chat.completions (JSON-preferred)", confidence=0.5
-    ))
-    obj = _chat_llm_sync(
-        MODEL_NAME,
-        [
-            {"role": "system", "content": LLM_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                "Project Name: " + (record.project_name or "") + "\n"
-                "Project Description: " + (record.description or "") + "\n"
-                "\nReturn ONLY valid JSON with fields: {\"eligible\": true|false, \"confidence\": 0..1, \"rationale\": \"short explanation\"}."
-            )}
-        ]
-    )
-    eligible, confidence, rationale = _normalize_llm_json(obj, record.description)
-    if not rationale:
-        rationale = _backfill_rationale_sync(record.description, eligible)
+        model_name="parser:v0", thought="Parse incoming project record into analysis fields.",
+        action="parse", observation=f"Got description length={len(record.description or '')}",
+        confidence=1.0,
+    )]
 
-    confidence = _coerce_confidence(confidence)
+    result = _tier3_llm_sync(record)  # raises on error; no fallback by design
+    steps.append(result.trace_step)
+
+    confidence = _coerce_confidence(result.confidence)
     steps.append(TraceStep(
         step_id=str(uuid.uuid4()), timestamp=datetime.utcnow().isoformat()+"Z",
         model_name="decision:v0", thought="Consolidate evidence and decide eligibility.",
-        action="decide", observation=f"eligible={eligible}, confidence={confidence:.2f}", confidence=confidence
+        action="decide", observation=f"eligible={result.eligible}, confidence={confidence:.2f}",
+        confidence=confidence,
     ))
 
     classification = ClassificationResult(
-        project_id=record.project_id, eligible=eligible, confidence=confidence,
-        rationale=rationale, region="US-IRS-Section-41"
+        project_id=record.project_id, eligible=result.eligible, confidence=confidence,
+        rationale=result.rationale, region="US-IRS-Section-41", criteria=result.criteria,
     )
     trace = TraceEnvelope(
         user_id=user_id, project_id=record.project_id, steps=steps,
-        model_name=(f"openai:{MODEL_NAME}" if USE_LLM else "rule-based:v0"),
-        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False
+        model_name=f"openai:{MODEL_NAME}",
+        region="US-IRS-Section-41", reviewer_id=None, legal_hold_flag=False,
     ).model_dump()
     return classification, trace

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 class ProjectRecord(BaseModel):
     project_id: str
@@ -16,6 +16,7 @@ class ClassificationResult(BaseModel):
     confidence: float = Field(ge=0, le=1)
     rationale: str
     region: str = "US-IRS-Section-41"
+    criteria: Optional[Dict[str, str]] = None  # None = Tier 1/2 result; synthesized downstream
 
 class TraceStep(BaseModel):
     step_id: str

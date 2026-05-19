@@ -24,7 +24,7 @@ from .explainability_pack import ExplainabilityGenerator
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL_NAME = os.getenv("OPENAI_MODEL", "qwen2.5:7b")
+MODEL_NAME = os.getenv("OPENAI_MODEL", "qwen2.5:3b")
 USE_LLM = bool(OPENAI_API_KEY)
 
 app = FastAPI(title="AI R&D Tax Credit Agent - MVP API", version="0.1.0")
@@ -130,13 +130,16 @@ def _enrich_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload["recommendation"] = rec
     payload["primary_risk"] = "Technological Uncertainty" if not eligible else "Documentation Sufficiency"
 
-    # Mock 4-part test for UI visualization (logic matches standard reasoning patterns)
-    payload["four_part_test"] = {
-        "permitted_purpose": "met" if eligible else "uncertain",
-        "elimination_uncertainty": "met" if eligible and conf > 0.7 else "uncertain",
-        "process_experimentation": "met" if eligible and conf > 0.8 else "uncertain",
-        "technological_nature": "met" if eligible else "met",
-    }
+    # Use real LLM criteria when available; synthesize for Tier 1/2 results
+    if payload.get("criteria"):
+        payload["four_part_test"] = payload["criteria"]
+    else:
+        payload["four_part_test"] = {
+            "permitted_purpose": "met" if eligible else "uncertain",
+            "elimination_uncertainty": "met" if eligible and conf > 0.7 else "uncertain",
+            "process_experimentation": "met" if eligible and conf > 0.8 else "uncertain",
+            "technological_nature": "met" if eligible else "met",
+        }
     payload["decision_flippers"] = [
         "Project involves genuine CS/Engineering research.",
         "Systematic trial and error was documented."
